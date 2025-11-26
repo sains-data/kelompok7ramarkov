@@ -1,0 +1,427 @@
+---
+title: "TUBES PEMSTOK"
+author: "Nabila"
+date: "2025-11-16"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Pemodelan Rantai Markov
+
+```{r}
+# 1. Load packages yang diperlukan
+
+
+required <- c("readxl","tidyverse","janitor","lubridate","markovchain",
+              "igraph","ggraph","ggplot2","expm","scales")
+new <- required[!(required %in% installed.packages()[, "Package"])]
+if(length(new)) install.packages(new)
+
+library(readxl)
+library(tidyverse)
+library(janitor)
+library(lubridate)
+library(markovchain)
+library(igraph)
+library(ggraph)
+library(ggplot2)
+library(expm)    # untuk pangkat matriks (%^%)
+library(scales)
+```
+
+```{r}
+# 2. Baca data
+
+Dataset_Kelompok7 <- read_excel("C:/Users/hp/Downloads/Dataset_Kelompok7.xlsx") %>%
+  clean_names()
+Dataset_Kelompok7
+```
+
+```{r}
+# 3. Filter mahasiswa TPB saja
+
+if(!"apakah_kamu_mahasiswa_tpb" %in% names(Dataset_Kelompok7)) {
+  stop("Kolom 'Apakah Kamu Mahasiswa TPB' tidak ditemukan. Periksa nama kolom file Excel Anda.")
+}
+
+df_tpb <- Dataset_Kelompok7 %>%
+  filter(str_to_upper(apakah_kamu_mahasiswa_tpb) == "YA") %>%
+  mutate(id = row_number())
+
+```
+
+```{r}
+# 4. Urutkan kolom aktivitas berdasarkan hari & jam
+
+parse_activity_col <- function(colname) {
+  tibble(
+    col = colname,
+    day = str_extract(colname, "senin|selasa|rabu|kamis|jumat"),
+    time = str_extract(colname, "\\d{2}_?\\d{2}|\\d{2}\\.\\d{2}") %>% 
+             str_replace_all("_", ":") %>% str_replace_all("\\.", ":")
+  )
+}
+time_info <- map_dfr(activity_cols, parse_activity_col)
+order_days <- c("senin","selasa","rabu","kamis","jumat")
+ordered_cols <- time_info %>%
+  mutate(day_ord = match(day, order_days),
+         time_num = ifelse(is.na(time), 0, as.numeric(str_replace(time, ":", ".")))) %>%
+  arrange(day_ord, time_num) %>%
+  pull(col)
+```
+
+```{r}
+# 5. Bentuk data long (urutan waktu per responden)
+
+df_long <- df_tpb %>%
+  select(id, all_of(ordered_cols)) %>%
+  pivot_longer(cols = -id, names_to = "slot", values_to = "state") %>%
+  mutate(
+    state = str_trim(state),
+    state = if_else(is.na(state) | state == "" | tolower(state) == "kosong", 
+                    "Kosong", state),
+    slot = factor(slot, levels = ordered_cols)
+  ) %>%
+  arrange(id, slot)
+
+```
+
+```{r}
+# 6. IDENTIFIKASI RUANG KEADAAN (State Space)
+
+states <- df_long %>% pull(state) %>% unique() %>% sort()
+cat("\n=== Ruang Keadaan (State Space) ===\n")
+print(states)
+
+# Simpan ukuran tiap state (frekuensi observasi)
+state_freq <- df_long %>% count(state, name = "visits") %>% arrange(desc(visits))
+cat("\n=== Frekuensi Kunjungan per State ===\n")
+print(state_freq)
+
+
+```
+
+```{r}
+# 7. PASANGAN TRANSISI (t -> t+1) & MATRIKS TRANSISI
+
+pairs <- df_long %>%
+  group_by(id) %>%              # perbaikan: gunakan 'id'
+  arrange(slot) %>%
+  mutate(next_state = lead(state)) %>%
+  ungroup() %>%
+  filter(!is.na(next_state)) %>%
+  count(state, next_state, name = "count")
+
+# Matriks counts
+mat_counts <- matrix(0, nrow = length(states), ncol = length(states),
+                     dimnames = list(states, states))
+
+for(i in seq_len(nrow(pairs))) {
+  mat_counts[pairs$state[i], pairs$next_state[i]] <- 
+    mat_counts[pairs$state[i], pairs$next_state[i]] + pairs$count[i]
+}
+
+# Matriks probabilitas
+row_sums <- rowSums(mat_counts)
+mat_prob <- mat_counts
+
+for(i in seq_len(nrow(mat_prob))) {
+  if(row_sums[i] > 0) {
+    mat_prob[i, ] <- mat_counts[i, ] / row_sums[i]
+  }
+}
+
+mat_prob[is.na(mat_prob)] <- 0
+
+cat("\n=== Matriks Transisi (Counts) ===\n")
+print(as.data.frame(mat_counts))
+
+cat("\n=== Matriks Transisi (Probabilities) ===\n")
+print(round(as.data.frame(mat_prob), 4))
+
+```
+
+```{r}
+# 8. OBJEK MARKOVCHAIN
+
+MC <- new("markovchain", states = states, transitionMatrix = mat_prob, name = "MC_Aktivitas_TPB")
+cat("\n=== Ringkasan Objek MarkovChain ===\n")
+print(MC)
+
+```
+
+```{r}
+library(igraph)
+library(tidygraph)
+library(ggraph)
+library(dplyr)
+
+# 1. Data Matriks Probabilitas
+
+states <- c("gedunge", "gku1", "kantin", "kosong", "labtek", "perpus")
+
+P <- matrix(c(
+  0.72, 0.06, 0.02, 0.12, 0.04, 0.04,
+  0.002148228, 0.7497315, 0.024704619, 0.1740064, 0.02900107, 0.020408163,
+  0.02083333,  0.2708333, 0.48958333,  0.125, 0.07291667, 0.02083333,
+  0.005102041, 0.1403061, 0.005102041, 0.7993197, 0.04676871, 0.003401361,
+  0.006410256, 0.1025641, 0.03525641, 0.1410256, 0.69871795, 0.01602564,
+  0.012345679, 0.1604938, 0.12345679, 0.0617284, 0.02469136, 0.617283951
+), nrow=6, byrow=TRUE)
+
+rownames(P) <- states
+colnames(P) <- states
+
+
+# 2. Buat edge list
+
+edges <- data.frame()
+
+for (i in 1:nrow(P)) {
+  for (j in 1:ncol(P)) {
+    if (P[i, j] > 0.05) {
+      edges <- rbind(edges, data.frame(
+        from = rownames(P)[i],
+        to   = colnames(P)[j],
+        weight = P[i, j]
+      ))
+    }
+  }
+}
+
+
+# 3. Buat graph tidygraph
+
+g <- tbl_graph(
+  nodes = tibble(name = states),
+  edges = edges,
+  directed = TRUE
+)
+
+# 4. Warna Node
+
+node_colors <- c(
+  "gedunge" = "#ffcccc",
+  "gku1"    = "#cce5ff",
+  "kantin"  = "#fff5cc",
+  "kosong"  = "#e6e6e6",
+  "labtek"  = "#d1ffd1",
+  "perpus"  = "#e3ccff"
+)
+
+# 5. Plot GRAF RAPIH (ggraph)
+
+set.seed(42)
+
+ggraph(g, layout = "fr") + 
+  geom_edge_link(aes(width = weight, label = sprintf("%.2f", weight)),
+                 arrow = arrow(length = unit(3, "mm")),
+                 end_cap = circle(3, 'mm'),
+                 alpha = 0.7,
+                 label_dodge = unit(1, "mm"),
+                 angle_calc = "along",
+                 label_colour = "gray20") +
+  geom_node_point(aes(fill = name), size = 14, shape = 21, color = "black") +
+  geom_node_text(aes(label = name), size = 4, color = "black") +
+  scale_fill_manual(values = node_colors) +
+  scale_edge_width(range = c(0.3, 1.5)) +
+  theme_void() +
+  ggtitle("Graf Rantai Markov Aktivitas Mahasiswa TPB") +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(size=16, face="bold", hjust=0.5)
+  )
+
+```
+
+```{r}
+library(tidyverse)
+library(ggplot2)
+
+P_df <- P %>%
+  as.data.frame() %>%
+  mutate(from = rownames(P)) %>%
+  pivot_longer(
+    cols = -from,
+    names_to = "to",
+    values_to = "prob"
+  )
+
+ggplot(P_df, aes(x = to, y = from, fill = prob)) +
+  geom_tile() +
+  geom_text(aes(label = round(prob, 2)), color = "white", size = 4) +
+  scale_fill_gradient(low = "white", high = "steelblue") +
+  labs(
+    title = "Heatmap Matriks Transisi P",
+    x = "Next State",
+    y = "Current State"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+# 10. PROBABILITAS LANGKAH ke-n (P^n)
+
+library(expm)
+
+# Pilih n (ubah sesuai kebutuhan)
+n <- 3
+cat(sprintf("\n=== Matriks Transisi langkah ke-%d (P^%d) ===\n", n, n))
+mat_n <- mat_prob %^% n
+print(round(mat_n, 4))
+
+# Contoh: distribusi setelah n langkah dari state awal tertentu
+start_state <- if("gku1" %in% states) "gku1" else states[1]
+v0 <- rep(0, length(states)); names(v0) <- states
+v0[start_state] <- 1
+v_n <- v0 %*% mat_n
+cat(sprintf("\nProbabilitas distribusi setelah %d langkah mulai dari '%s':\n", n, start_state))
+print(round(as.vector(v_n), 4)); names(v_n) <- states
+
+
+```
+
+```{r}
+# 1. Hitung distribusi stasioner
+
+eig <- eigen(t(P))
+
+# ambil eigenvector dengan eigenvalue 1
+pi_raw <- Re(eig$vectors[, which.max(Re(eig$values))])
+
+# normalisasi agar jumlahnya = 1
+pi <- pi_raw / sum(pi_raw)
+names(pi) <- states
+
+# cek hasil
+pi
+
+# 2. Buat dataframe untuk plotting
+
+pi_df <- data.frame(
+  state = names(pi),
+  pi = as.numeric(pi)
+)
+
+library(ggplot2)
+
+ggplot(pi_df, aes(x=reorder(state, -pi), y=pi, fill=state)) +
+  geom_col(show.legend = FALSE) +
+  geom_text(aes(label=round(pi, 3)), vjust=-0.3, size=4) +
+  labs(title="Distribusi Stasioner (π)", y="π", x="State") +
+  theme_minimal(base_size = 14)
+
+```
+
+```{r}
+library(igraph)   
+library(tidyverse)
+
+# 12. KLASIFIKASI RUANG KEADAAN
+
+# adjacency matrix: ubah probabilitas > 0 menjadi 1
+adj_mat <- mat_prob
+adj_mat[adj_mat > 0] <- 1
+
+# Buat graf dari adjacency matrix
+g_adj <- graph_from_adjacency_matrix(adj_mat, mode = "directed")
+
+# Strongly Connected Components (SCC)
+scc <- components(g_adj, mode = "strong")
+
+# kelompokkan node berdasarkan SCC
+classes <- split(V(g_adj)$name, scc$membership)
+cat("\n=== Communicating classes (Strongly Connected Components) ===\n")
+print(classes)
+
+# ---- fungsi cek apakah sebuah kelas closed ----
+is_closed <- function(nodes, trans_mat) {
+  outside <- setdiff(colnames(trans_mat), nodes)
+  for(from in nodes) {
+    if(sum(trans_mat[from, outside]) > 0) return(FALSE)
+  }
+  return(TRUE)
+}
+
+# Informasi setiap SCC
+class_info <- tibble(
+  class_id   = names(classes),
+  members    = sapply(classes, function(x) paste(x, collapse = ", ")),
+  size       = sapply(classes, length)
+) %>%
+  mutate(closed = map_lgl(classes, ~ is_closed(.x, mat_prob))) %>%
+  mutate(type   = ifelse(closed, "Closed / Recurrent", "Non-closed / Transient"))
+
+cat("\n=== Informasi Kelas (closed / transient) ===\n")
+print(class_info)
+
+# --- Absorbing state ---
+absorbing <- states[which(diag(mat_prob) == 1)]
+cat("\n=== Absorbing states (P[ii] == 1) ===\n")
+if (length(absorbing) > 0) {
+  print(absorbing)
+} else {
+  cat("Tidak ada absorbing state berdasarkan P[ii] == 1\n")
+}
+
+# --- Recurrent vs Transient state ---
+recurrent_states <- unlist(classes[
+  which(sapply(classes, function(x) is_closed(x, mat_prob)))
+])
+
+transient_states <- setdiff(states, recurrent_states)
+
+cat("\n=== Ringkasan Klasifikasi tiap State ===\n")
+print(tibble(
+  state = states,
+  classification = ifelse(
+    states %in% recurrent_states,
+    "Recurrent (anggota closed class)",
+    "Transient (dapat keluar ke state lain)"
+  )
+))
+
+```
+
+```{r}
+# 13. Mean First Passage Time (opsional) - jika dapat dihitung
+
+mfpt <- tryCatch(meanFirstPassageTime(MC), error = function(e) NULL)
+if(!is.null(mfpt)) {
+  cat("\n=== Mean First Passage Time (MFPT) Table ===\n")
+  print(round(mfpt, 3))
+} else {
+  cat("\nMFPT tidak dapat dihitung untuk chain ini (mungkin karena non-irreducible atau numerik).\n")
+}
+
+```
+
+```{r}
+# 14. SIMULASI LINTASAN
+
+# daftar state sesuai MC
+states_MC <- c("GEDUNG E", "GKU 1", "KANTIN", "Kosong", "LABTEK", "PERPUSTAKAAN")
+
+# pilih start state sesuai daftar
+start_state <- "GKU 1"   # boleh diganti salah satu dari states_MC
+
+# SIMULASI MARKOV
+set.seed(2025)
+sim_path <- rmarkovchain(
+  n = 20,
+  object = MC,
+  t0 = start_state
+)
+
+cat("\nContoh simulasi 20 langkah mulai dari", start_state, ":\n")
+print(sim_path)
+
+
+
+```
+
